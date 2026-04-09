@@ -1,0 +1,560 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+"""
+Structured variability in a redundant control system:
+simulation code corresponding to the revised Methods.
+
+This script:
+1. simulates five conditions:
+   - baseline
+   - shock_up
+   - shock_down
+   - k_low
+   - k_high
+2. computes trial-level and condition-level metrics
+3. saves outputs as CSV files to the Desktop
+
+Tested for Python 3.10+ with:
+numpy, pandas
+"""
+
+from __future__ import annotations
+
+import math
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Dict, List, Tuple
+
+import numpy as np
+import pandas as pd
+
+
+# ============================================================
+# Parameters
+# ============================================================
+
+ALPHA = 0.35
+BASELINE_K = 0.04
+LOW_K = 0.01
+HIGH_K = 0.10
+
+SIGMA2_BASE = 0.3
+SIGMA2_UP = 0.9
+SIGMA2_DOWN = 0.1
+
+T_STEPS = 3000
+N_TRIALS = 80
+WINDOW = 50
+SHOCK_T = 1500
+
+STATE_CLIP_MIN = -50.0
+STATE_CLIP_MAX = 50.0
+
+EPS_VAR = 1e-10
+EPS_SING = 1e-12
+
+SEED = 20260409
+
+EARLY_START, EARLY_END = 0, 599
+LATE_START, LATE_END = 2400, 2999
+PRE_START, PRE_END = 1450, 1499
+POST_START, POST_END = 1500, 1549
+RELEARN_START, RELEARN_END = 1500, 2099
+
+OUTDIR = Path.home() / "Desktop" / "structured_variability_outputs"
+
+
+# ============================================================
+# Condition definition
+# ============================================================
+
+@dataclass(frozen=True)
+class Condition:
+    name: str
+    k: float
+    mode: str  # "baseline", "shock_up", "shock_down", "k_low", "k_high"
+
+
+CONDITIONS: List[Condition] = [
+    Condition("baseline", BASELINE_K, "baseline"),
+    Condition("shock_up", BASELINE_K, "shock_up"),
+    Condition("shock_down", BASELINE_K, "shock_down"),
+    Condition("k_low", LOW_K, "k_low"),
+    Condition("k_high", HIGH_K, "k_high"),
+]
+
+
+# ============================================================
+# Core model functions
+# ============================================================
+
+def sigma2_schedule(t: int, mode: str) -> float:
+    """Return perturbation variance sigma(t)^2."""
+    if mode == "baseline":
+        return SIGMA2_BASE
+    if mode == "shock_up":
+        return SIGMA2_BASE if t < SHOCK_T else SIGMA2_UP
+    if mode == "shock_down":
+        return SIGMA2_BASE if t < SHOCK_T else SIGMA2_DOWN
+    if mode in ("k_low", "k_high"):
+        return SIGMA2_BASE
+    raise ValueError(f"Unknown mode: {mode}")
+
+
+def task_output(x: np.ndarray, alpha: float = ALPHA) -> np.ndarray:
+    """
+    y1 = x1 + alpha * x3 * x1
+    y2 = x2 + alpha * x3 * x2
+    """
+    x1, x2, x3 = x
+    return np.array([
+        x1 + alpha * x3 * x1,
+        x2 + alpha * x3 * x2,
+    ], dtype=float)
+
+
+def jacobian(x: np.ndarray, alpha: float = ALPHA) -> np.ndarray:
+    """
+    J =
+    [ 1 + alpha*x3,       0,      alpha*x1 ]
+    [      0,        1 + alpha*x3, alpha*x2 ]
+    """
+    x1, x2, x3 = x
+    return np.array([
+        [1.0 + alpha * x3, 0.0, alpha * x1],
+        [0.0, 1.0 + alpha * x3, alpha * x2],
+    ], dtype=float)
+
+
+def projectors(J: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    P_task = J^+ J
+    P_null = I - P_task
+    """
+    J_pinv = np.linalg.pinv(J)
+    P_task = J_pinv @ J
+    P_task = 0.5 * (P_task + P_task.T)
+    P_null = np.eye(3) - P_task
+    P_null = 0.5 * (P_null + P_null.T)
+    return P_task, P_null
+
+
+def control_input(x: np.ndarray, k: float) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """
+    u = -k J^T y
+    Returns u, y, J, P_task/P_null are computed elsewhere if needed.
+    """
+    y = task_output(x)
+    J = jacobian(x)
+    u = -k * (J.T @ y)
+    return u, y, J, np.array([np.linalg.norm(y)])
+
+
+def frob_norm(J: np.ndarray) -> float:
+    return float(np.linalg.norm(J, ord="fro"))
+
+
+def singular_values_and_cond(J: np.ndarray) -> Tuple[np.ndarray, float]:
+    svals = np.linalg.svd(J, compute_uv=False)
+    s1 = float(svals[0])
+    s2 = float(svals[-1])
+    cond_val = math.inf if s2 <= EPS_SING else s1 / s2
+    return svals, cond_val
+
+
+def d_singularity(x: np.ndarray, alpha: float = ALPHA) -> float:
+    """
+    Singular surface: 1 + alpha*x3 = 0  =>  x3 = -1/alpha
+    d_sing = |x3 + 1/alpha|
+    """
+    return float(abs(x[2] + 1.0 / alpha))
+
+
+def mean_over_range(arr: np.ndarray, start: int, end: int) -> float:
+    """Inclusive range mean."""
+    return float(np.mean(arr[start:end + 1]))
+
+
+def safe_trace(M: np.ndarray) -> float:
+    return float(np.trace(M))
+
+
+# ============================================================
+# Trial simulation
+# ============================================================
+
+def simulate_trial(cond: Condition, rng: np.random.Generator) -> Dict[str, np.ndarray]:
+    """
+    Simulate one trial.
+    Returns time series arrays for state, outputs, metrics.
+    """
+    x = np.zeros((T_STEPS, 3), dtype=float)
+    y = np.zeros((T_STEPS, 2), dtype=float)
+    e = np.zeros(T_STEPS, dtype=float)
+
+    u = np.zeros((T_STEPS, 3), dtype=float)
+    xi = np.zeros((T_STEPS, 3), dtype=float)
+
+    J_store = np.zeros((T_STEPS, 2, 3), dtype=float)
+    j_frob = np.zeros(T_STEPS, dtype=float)
+    condJ = np.zeros(T_STEPS, dtype=float)
+    dsing = np.zeros(T_STEPS, dtype=float)
+    sigma2_t = np.zeros(T_STEPS, dtype=float)
+
+    rho_task = np.zeros(T_STEPS, dtype=float)
+    rho_null = np.zeros(T_STEPS, dtype=float)
+
+    V_state = np.zeros(T_STEPS, dtype=float)
+    V_null = np.zeros(T_STEPS, dtype=float)
+    R_null = np.zeros(T_STEPS, dtype=float)
+    CAC = np.zeros(T_STEPS, dtype=float)
+
+    # initial condition
+    x[0] = rng.uniform(-1.0, 1.0, size=3)
+
+    for t in range(T_STEPS):
+        # current geometry / control
+        yt = task_output(x[t])
+        Jt = jacobian(x[t])
+        Pt, Pn = projectors(Jt)
+
+        ut = -cond.k * (Jt.T @ yt)
+
+        svals, cond_val = singular_values_and_cond(Jt)
+        ds = d_singularity(x[t])
+
+        u_task = Pt @ ut
+        u_null = Pn @ ut
+        denom = np.linalg.norm(ut) + 1e-12
+        rho_task[t] = float(np.linalg.norm(u_task) / denom)
+        rho_null[t] = float(np.linalg.norm(u_null) / denom)
+
+        y[t] = yt
+        e[t] = np.linalg.norm(yt)
+        u[t] = ut
+        J_store[t] = Jt
+        j_frob[t] = frob_norm(Jt)
+        condJ[t] = cond_val
+        dsing[t] = ds
+
+        # realized variability from sliding window up to time t
+        if t >= WINDOW - 1:
+            window_x = x[t - WINDOW + 1:t + 1]
+            x_bar = np.mean(window_x, axis=0)
+            centered = window_x - x_bar
+            Cx = (centered.T @ centered) / (WINDOW - 1)
+
+            Vst = safe_trace(Cx)
+            Cnull = Pn @ Cx @ Pn
+            Vnl = safe_trace(Cnull)
+
+            V_state[t] = Vst
+            V_null[t] = Vnl
+            CAC[t] = Vnl
+            R_null[t] = 0.0 if Vst <= EPS_VAR else float(Vnl / Vst)
+        else:
+            V_state[t] = 0.0
+            V_null[t] = 0.0
+            CAC[t] = 0.0
+            R_null[t] = 0.0
+
+        # update next state
+        if t < T_STEPS - 1:
+            sigma2_now = sigma2_schedule(t, cond.mode)
+            sigma2_t[t] = sigma2_now
+            xi_t = rng.multivariate_normal(mean=np.zeros(3), cov=sigma2_now * np.eye(3))
+            xi[t] = xi_t
+
+            x_next = x[t] + ut + xi_t
+            x_next = np.clip(x_next, STATE_CLIP_MIN, STATE_CLIP_MAX)
+            x[t + 1] = x_next
+
+    # final sigma record for completeness
+    sigma2_t[-1] = sigma2_schedule(T_STEPS - 1, cond.mode)
+
+    return {
+        "x": x,
+        "y": y,
+        "e": e,
+        "u": u,
+        "xi": xi,
+        "J": J_store,
+        "J_frob": j_frob,
+        "condJ": condJ,
+        "d_sing": dsing,
+        "sigma2": sigma2_t,
+        "V_state": V_state,
+        "V_null": V_null,
+        "R_null": R_null,
+        "CAC": CAC,
+        "rho_task": rho_task,
+        "rho_null": rho_null,
+    }
+
+
+# ============================================================
+# Trial summaries
+# ============================================================
+
+def recovery_time_from_error(e: np.ndarray) -> int:
+    """
+    Recovery time = first t >= 1500 such that e(t) <= mean_pre(e).
+    If not recovered by t = 2999, set to 1500.
+    """
+    e_pre = mean_over_range(e, PRE_START, PRE_END)
+    for t in range(SHOCK_T, T_STEPS):
+        if e[t] <= e_pre:
+            return t - SHOCK_T
+    return T_STEPS - SHOCK_T  # 1500
+
+
+def summarize_trial(cond: Condition, trial_idx: int, sim: Dict[str, np.ndarray]) -> Dict[str, float]:
+    e = sim["e"]
+    CAC = sim["CAC"]
+    R_null = sim["R_null"]
+    J_frob = sim["J_frob"]
+    condJ = sim["condJ"]
+    d_sing = sim["d_sing"]
+    sigma2 = sim["sigma2"]
+    rho_task = sim["rho_task"]
+    rho_null = sim["rho_null"]
+
+    e_pre = mean_over_range(e, PRE_START, PRE_END)
+    e_post = mean_over_range(e, POST_START, POST_END)
+    cac_pre = mean_over_range(CAC, PRE_START, PRE_END)
+    cac_post = mean_over_range(CAC, POST_START, POST_END)
+    rnull_pre = mean_over_range(R_null, PRE_START, PRE_END)
+    rnull_post = mean_over_range(R_null, POST_START, POST_END)
+
+    # late-window coupling
+    late_slice = slice(LATE_START, LATE_END + 1)
+    late_CAC = CAC[late_slice]
+    late_e = e[late_slice]
+    late_J = J_frob[late_slice]
+
+    def safe_corr(a: np.ndarray, b: np.ndarray) -> float:
+        if np.std(a) < 1e-12 or np.std(b) < 1e-12:
+            return np.nan
+        return float(np.corrcoef(a, b)[0, 1])
+
+    dCAC = np.diff(late_CAC)
+    de = np.diff(late_e)
+    dJ = np.diff(late_J)
+
+    summary = {
+        "condition": cond.name,
+        "trial": trial_idx,
+
+        # time-window means
+        "e_early": mean_over_range(e, EARLY_START, EARLY_END),
+        "e_late": mean_over_range(e, LATE_START, LATE_END),
+        "CAC_early": mean_over_range(CAC, EARLY_START, EARLY_END),
+        "CAC_late": mean_over_range(CAC, LATE_START, LATE_END),
+        "Rnull_early": mean_over_range(R_null, EARLY_START, EARLY_END),
+        "Rnull_late": mean_over_range(R_null, LATE_START, LATE_END),
+        "Jfrob_early": mean_over_range(J_frob, EARLY_START, EARLY_END),
+        "Jfrob_late": mean_over_range(J_frob, LATE_START, LATE_END),
+        "condJ_early": mean_over_range(condJ, EARLY_START, EARLY_END),
+        "condJ_late": mean_over_range(condJ, LATE_START, LATE_END),
+        "d_sing_early": mean_over_range(d_sing, EARLY_START, EARLY_END),
+        "d_sing_late": mean_over_range(d_sing, LATE_START, LATE_END),
+        "sigma2_early": mean_over_range(sigma2, EARLY_START, EARLY_END),
+        "sigma2_late": mean_over_range(sigma2, LATE_START, LATE_END),
+        "rho_task_late": mean_over_range(rho_task, LATE_START, LATE_END),
+        "rho_null_late": mean_over_range(rho_null, LATE_START, LATE_END),
+
+        # pre/post summaries
+        "e_pre": e_pre,
+        "e_post": e_post,
+        "CAC_pre": cac_pre,
+        "CAC_post": cac_post,
+        "Rnull_pre": rnull_pre,
+        "Rnull_post": rnull_post,
+
+        # deltas
+        "delta_e": e_post - e_pre,
+        "delta_CAC": cac_post - cac_pre,
+        "delta_Rnull": rnull_post - rnull_pre,
+
+        # learning / relearning
+        "learning_speed": float(e[0] - e[599]),
+        "relearning_speed": float(e[1500] - e[2099]),
+
+        # recovery
+        "recovery_time": recovery_time_from_error(e),
+
+        # geometric exposure
+        "max_cond_post": float(np.max(condJ[SHOCK_T:])),
+        "min_d_sing_post": float(np.min(d_sing[SHOCK_T:])),
+        "max_e_post": float(np.max(e[SHOCK_T:])),
+
+        # late-phase couplings
+        "corr_CAC_e_late": safe_corr(late_CAC, late_e),
+        "corr_CAC_Jfrob_late": safe_corr(late_CAC, late_J),
+        "corr_dCAC_de_late": safe_corr(dCAC, de),
+        "corr_dCAC_dJ_late": safe_corr(dCAC, dJ),
+    }
+    return summary
+
+
+# ============================================================
+# Condition-level aggregation
+# ============================================================
+
+def aggregate_condition(trial_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Mean, SD, median, min, max for numeric trial-level fields.
+    """
+    numeric_cols = [c for c in trial_df.columns if c not in ("condition", "trial")]
+    rows = []
+    cond_name = str(trial_df["condition"].iloc[0])
+
+    for col in numeric_cols:
+        series = pd.to_numeric(trial_df[col], errors="coerce")
+        rows.append({
+            "condition": cond_name,
+            "metric": col,
+            "mean": float(series.mean()),
+            "sd": float(series.std(ddof=1)),
+            "median": float(series.median()),
+            "min": float(series.min()),
+            "max": float(series.max()),
+            "n": int(series.notna().sum()),
+        })
+    return pd.DataFrame(rows)
+
+
+def aggregate_timeseries(condition_name: str, timeseries_accum: Dict[str, List[np.ndarray]]) -> pd.DataFrame:
+    """
+    Aggregates time series across trials as mean and SD at each time point.
+    """
+    records = []
+    metric_names = [
+        "e", "CAC", "R_null", "J_frob", "condJ", "d_sing", "sigma2",
+        "rho_task", "rho_null", "V_state", "V_null"
+    ]
+
+    for metric in metric_names:
+        arr = np.vstack(timeseries_accum[metric])  # (n_trials, T)
+        mean_arr = np.mean(arr, axis=0)
+        sd_arr = np.std(arr, axis=0, ddof=1)
+
+        for t in range(T_STEPS):
+            records.append({
+                "condition": condition_name,
+                "time": t,
+                "metric": metric,
+                "mean": float(mean_arr[t]),
+                "sd": float(sd_arr[t]),
+            })
+
+    return pd.DataFrame(records)
+
+
+# ============================================================
+# Main
+# ============================================================
+
+def main() -> None:
+    OUTDIR.mkdir(parents=True, exist_ok=True)
+
+    master_trial_rows: List[Dict[str, float]] = []
+    master_cond_rows: List[pd.DataFrame] = []
+    master_timeseries_rows: List[pd.DataFrame] = []
+
+    rng_master = np.random.default_rng(SEED)
+
+    for cond in CONDITIONS:
+        print(f"Running condition: {cond.name}")
+
+        trial_rows: List[Dict[str, float]] = []
+        timeseries_accum: Dict[str, List[np.ndarray]] = {
+            "e": [],
+            "CAC": [],
+            "R_null": [],
+            "J_frob": [],
+            "condJ": [],
+            "d_sing": [],
+            "sigma2": [],
+            "rho_task": [],
+            "rho_null": [],
+            "V_state": [],
+            "V_null": [],
+        }
+
+        for trial_idx in range(N_TRIALS):
+            # independent trial RNG derived from master
+            trial_seed = int(rng_master.integers(0, 2**32 - 1))
+            rng_trial = np.random.default_rng(trial_seed)
+
+            sim = simulate_trial(cond, rng_trial)
+            summary = summarize_trial(cond, trial_idx, sim)
+
+            trial_rows.append(summary)
+            master_trial_rows.append(summary)
+
+            timeseries_accum["e"].append(sim["e"])
+            timeseries_accum["CAC"].append(sim["CAC"])
+            timeseries_accum["R_null"].append(sim["R_null"])
+            timeseries_accum["J_frob"].append(sim["J_frob"])
+            timeseries_accum["condJ"].append(sim["condJ"])
+            timeseries_accum["d_sing"].append(sim["d_sing"])
+            timeseries_accum["sigma2"].append(sim["sigma2"])
+            timeseries_accum["rho_task"].append(sim["rho_task"])
+            timeseries_accum["rho_null"].append(sim["rho_null"])
+            timeseries_accum["V_state"].append(sim["V_state"])
+            timeseries_accum["V_null"].append(sim["V_null"])
+
+        cond_trial_df = pd.DataFrame(trial_rows)
+        cond_trial_path = OUTDIR / f"{cond.name}_trial_summary.csv"
+        cond_trial_df.to_csv(cond_trial_path, index=False)
+
+        cond_agg_df = aggregate_condition(cond_trial_df)
+        cond_agg_path = OUTDIR / f"{cond.name}_condition_summary.csv"
+        cond_agg_df.to_csv(cond_agg_path, index=False)
+        master_cond_rows.append(cond_agg_df)
+
+        cond_ts_df = aggregate_timeseries(cond.name, timeseries_accum)
+        cond_ts_path = OUTDIR / f"{cond.name}_timeseries_summary.csv"
+        cond_ts_df.to_csv(cond_ts_path, index=False)
+        master_timeseries_rows.append(cond_ts_df)
+
+        print(f"Saved: {cond_trial_path}")
+        print(f"Saved: {cond_agg_path}")
+        print(f"Saved: {cond_ts_path}")
+
+    all_trial_df = pd.DataFrame(master_trial_rows)
+    all_trial_df.to_csv(OUTDIR / "all_conditions_trial_summary.csv", index=False)
+
+    all_cond_df = pd.concat(master_cond_rows, ignore_index=True)
+    all_cond_df.to_csv(OUTDIR / "all_conditions_condition_summary.csv", index=False)
+
+    all_ts_df = pd.concat(master_timeseries_rows, ignore_index=True)
+    all_ts_df.to_csv(OUTDIR / "all_conditions_timeseries_summary.csv", index=False)
+
+    # Simple manifest
+    manifest = pd.DataFrame({
+        "file": [
+            "all_conditions_trial_summary.csv",
+            "all_conditions_condition_summary.csv",
+            "all_conditions_timeseries_summary.csv",
+        ] + [f"{c.name}_trial_summary.csv" for c in CONDITIONS]
+          + [f"{c.name}_condition_summary.csv" for c in CONDITIONS]
+          + [f"{c.name}_timeseries_summary.csv" for c in CONDITIONS],
+        "description": [
+            "Trial-level metrics for all conditions",
+            "Condition-level aggregate statistics for all conditions",
+            "Time-series mean and SD for all conditions",
+        ] + [f"Trial-level summary for {c.name}" for c in CONDITIONS]
+          + [f"Condition-level summary for {c.name}" for c in CONDITIONS]
+          + [f"Time-series summary for {c.name}" for c in CONDITIONS]
+    })
+    manifest.to_csv(OUTDIR / "manifest.csv", index=False)
+
+    print("\nDone.")
+    print(f"Outputs saved to: {OUTDIR}")
+
+
+if __name__ == "__main__":
+    main()
